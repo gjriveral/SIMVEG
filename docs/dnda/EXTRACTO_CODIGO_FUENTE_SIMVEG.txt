@@ -1,0 +1,1255 @@
+================================================================================
+SIMVEG - SISTEMA DE SIMULACION Y MODELADO DE VIOLENCIAS CON ENFASIS EN GENERO
+EXTRACTO CONSOLIDADO DE CODIGO FUENTE
+Version: 1.0
+Titular: UNAD - Universidad Nacional Abierta y a Distancia
+Lenguaje: Python 3.11+
+Punto de entrada: simveg.py
+Proposito del documento: Soporte tecnico para registro ante la DNDA (Colombia)
+================================================================================
+
+
+================================================================================
+ARCHIVO: config.py
+DESCRIPCION: Constantes globales de identidad y metadatos del sistema SIMVEG.
+================================================================================
+
+"""Constantes globales de marca y metadatos de SIMVEG."""
+
+APP_NAME_SHORT = "SIMVEG"
+APP_NAME_FULL = (
+    "SIMVEG - Sistema de Simulación y Modelado de Violencias con Énfasis en Género"
+)
+APP_DESCRIPTION = "Sistema de Simulación y Modelado de Violencias con Énfasis en Género"
+APP_REGION = "Departamento de Antioquia, Colombia"
+
+
+# PROPOSITO SIMVEG: Generar titulo de pestana del navegador por modulo.
+def get_page_title(section: str) -> str:
+    """Título de pestaña del navegador: '<Sección> | SIMVEG'."""
+    return f"{section} | {APP_NAME_SHORT}"
+
+
+================================================================================
+ARCHIVO: ui/branding.py
+DESCRIPCION: Componentes visuales reutilizables de la interfaz SIMVEG.
+================================================================================
+
+import streamlit as st
+
+from config import APP_DESCRIPTION, APP_NAME_FULL, APP_NAME_SHORT
+
+
+# PROPOSITO SIMVEG: Renderizar marca SIMVEG en barra lateral.
+def render_sidebar_branding() -> None:
+    """Marca SIMVEG en la barra lateral."""
+    st.sidebar.markdown(f"**{APP_NAME_SHORT}**")
+    st.sidebar.caption(APP_DESCRIPTION)
+    st.sidebar.divider()
+
+
+# PROPOSITO SIMVEG: Mostrar encabezado institucional y titulo del modulo.
+def render_platform_header(module_title: str, module_subtitle: str | None = None) -> None:
+    """Encabezado principal de la plataforma y título del módulo."""
+    st.markdown(f"## {APP_NAME_SHORT}")
+    st.caption(APP_NAME_FULL)
+    st.divider()
+    st.title(module_title)
+    if module_subtitle:
+        st.markdown(module_subtitle)
+
+
+# PROPOSITO SIMVEG: Mostrar pie de pagina con identidad del software.
+def render_platform_footer() -> None:
+    """Pie de página con la identidad de la plataforma."""
+    st.markdown("---")
+    st.caption(f"{APP_NAME_FULL} · {APP_DESCRIPTION}")
+
+
+================================================================================
+ARCHIVO: simveg.py
+DESCRIPCION: Punto de entrada principal. Modulo de pronostico temporal con Prophet.
+================================================================================
+
+import io
+import pandas as pd
+import streamlit as st
+from pathlib import Path
+from typing import Tuple
+from prophet import Prophet
+import plotly.graph_objects as go
+
+from config import APP_REGION, get_page_title
+from ui.branding import (
+    render_platform_footer,
+    render_platform_header,
+    render_sidebar_branding,
+)
+
+DATA_PATH = Path("data/processed/SerieMensual.csv")
+DATA_PATH_STR = str(DATA_PATH)
+
+
+@st.cache_data(show_spinner="Cargando dataset SIMVEG…")
+# PROPOSITO SIMVEG: Cargar y normalizar la serie historica mensual desde CSV.
+def load_data(path: str = DATA_PATH_STR) -> pd.DataFrame:
+    """Carga la serie mensual consolidada (una sola vez en memoria)."""
+    df = pd.read_csv(path, parse_dates=["fecha"])
+
+    df["anio_hecho"] = df["anio_hecho"].astype(int)
+    df["mes_num"] = df["mes_num"].astype(int)
+
+    text_cols = [
+        "nombre_municipio",
+        "estrato",
+        "sexo_victima",
+        "sexo_agresor",
+        "naturaleza",
+        "nat_viosex",
+        "rango_edad",
+    ]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+        else:
+            df[col] = "Sin Dato"
+    return df
+
+
+@st.cache_data
+# PROPOSITO SIMVEG: Obtener subconjunto de datos filtrado por rango de anos.
+def filter_data_by_years(year_min: int, year_max: int) -> pd.DataFrame:
+    """Subconjunto del dataset por rango de años (cacheado)."""
+    df = load_data()
+    return df[(df["anio_hecho"] >= year_min) & (df["anio_hecho"] <= year_max)]
+
+
+# PROPOSITO SIMVEG: Aplicar filtros sociodemograficos y de modalidad.
+def _filter_series(
+    df: pd.DataFrame,
+    municipio: str,
+    estrato: str,
+    sexo_victima: str,
+    sexo_agresor: str,
+    naturaleza: str,
+    nat_viosex: str,
+    rango_edad: str,
+) -> pd.DataFrame:
+    df_f = df.copy()
+
+    if municipio != "Todos":
+        df_f = df_f[df_f["nombre_municipio"] == municipio]
+    if estrato != "Todos":
+        df_f = df_f[df_f["estrato"] == estrato]
+    if sexo_victima != "Todos":
+        df_f = df_f[df_f["sexo_victima"] == sexo_victima]
+    if sexo_agresor != "Todos":
+        df_f = df_f[df_f["sexo_agresor"] == sexo_agresor]
+    if naturaleza != "Todos":
+        df_f = df_f[df_f["naturaleza"] == naturaleza]
+    if nat_viosex != "Todos":
+        df_f = df_f[df_f["nat_viosex"] == nat_viosex]
+    if rango_edad != "Todos":
+        df_f = df_f[df_f["rango_edad"] == rango_edad]
+
+    return df_f
+
+
+# PROPOSITO SIMVEG: Construir serie temporal agregada para entrenamiento Prophet.
+def _build_time_series(df_f: pd.DataFrame) -> pd.DataFrame:
+    ts = (
+        df_f.groupby("fecha", as_index=False)["casos"]
+        .sum()
+        .rename(columns={"fecha": "ds", "casos": "y"})
+        .sort_values("ds")
+    )
+
+    if ts.empty or ts["y"].sum() == 0:
+        raise ValueError("No hay datos para la combinación de filtros seleccionada.")
+
+    return ts
+
+
+# PROPOSITO SIMVEG: Extraer parametros matematicos del modelo Prophet.
+def _extract_prophet_params(model: Prophet) -> list[dict]:
+    prophet_params = [
+        {
+            "Parámetro Matemático": "Crecimiento (Growth)",
+            "Valor": str(model.growth),
+        },
+        {
+            "Parámetro Matemático": "Escala de Normalización de 'y' (y_scale)",
+            "Valor": float(model.y_scale),
+        },
+        {
+            "Parámetro Matemático": "Escala de Prior para Puntos de Cambio",
+            "Valor": float(model.changepoint_prior_scale),
+        },
+        {
+            "Parámetro Matemático": "Escala de Prior para Estacionalidad",
+            "Valor": float(model.seasonality_prior_scale),
+        },
+        {
+            "Parámetro Matemático": "Total de Puntos de Cambio Detectados",
+            "Valor": len(model.changepoints),
+        },
+    ]
+
+    if hasattr(model, "params") and model.params is not None:
+        prophet_params.extend(
+            [
+                {
+                    "Parámetro Matemático": "Tasa de Crecimiento Base (k)",
+                    "Valor": float(model.params["k"][0][0]),
+                },
+                {
+                    "Parámetro Matemático": "Offset / Intercepto de Tendencia (m)",
+                    "Valor": float(model.params["m"][0][0]),
+                },
+                {
+                    "Parámetro Matemático": "Ruido de Observación (sigma_obs)",
+                    "Valor": float(model.params["sigma_obs"][0][0]),
+                },
+            ]
+        )
+
+    for name, props in model.seasonalities.items():
+        prophet_params.append(
+            {
+                "Parámetro Matemático": f"Estacionalidad '{name}' (Orden de Fourier)",
+                "Valor": props["fourier_order"],
+            }
+        )
+        prophet_params.append(
+            {
+                "Parámetro Matemático": f"Estacionalidad '{name}' (Prior Scale)",
+                "Valor": props["prior_scale"],
+            }
+        )
+
+    return prophet_params
+
+
+@st.cache_resource(show_spinner="Entrenando modelo Prophet…")
+# PROPOSITO SIMVEG: Entrenar modelo Prophet con filtros seleccionados.
+def train_model_for(
+    municipio: str,
+    estrato: str,
+    sexo_victima: str,
+    sexo_agresor: str,
+    naturaleza: str,
+    nat_viosex: str,
+    rango_edad: str,
+    year_min: int,
+    year_max: int,
+) -> Tuple[Prophet, pd.DataFrame]:
+    df = filter_data_by_years(year_min, year_max)
+    df_f = _filter_series(
+        df,
+        municipio,
+        estrato,
+        sexo_victima,
+        sexo_agresor,
+        naturaleza,
+        nat_viosex,
+        rango_edad,
+    )
+
+    if df_f.empty:
+        raise ValueError("No hay datos para la combinación de filtros seleccionada.")
+
+    ts = _build_time_series(df_f)
+
+    model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        changepoint_range=0.95,
+        changepoint_prior_scale=0.5,
+        seasonality_prior_scale=5.0,
+        seasonality_mode="multiplicative",
+    )
+    model.fit(ts)
+
+    return model, ts
+
+
+@st.cache_data(show_spinner="Calculando pronóstico…")
+# PROPOSITO SIMVEG: Ejecutar prediccion futura y retornar resultados cacheados.
+def compute_forecast(
+    municipio: str,
+    estrato: str,
+    sexo_victima: str,
+    sexo_agresor: str,
+    naturaleza: str,
+    nat_viosex: str,
+    rango_edad: str,
+    year_min: int,
+    year_max: int,
+    meses: int,
+) -> dict:
+    """Entrena (si hace falta) y predice una sola vez por combinación de filtros."""
+    model, ts = train_model_for(
+        municipio,
+        estrato,
+        sexo_victima,
+        sexo_agresor,
+        naturaleza,
+        nat_viosex,
+        rango_edad,
+        year_min,
+        year_max,
+    )
+
+    dias_pronostico = int(meses * 30.4368)
+    future = model.make_future_dataframe(periods=dias_pronostico, freq="D")
+    fcst = model.predict(future)
+
+    last_hist = ts["ds"].max()
+    fcst_future = fcst[fcst["ds"] > last_hist].copy()
+
+    cols_clip = ["yhat", "yhat_lower", "yhat_upper"]
+    fcst_future[cols_clip] = fcst_future[cols_clip].clip(lower=0)
+
+    return {
+        "ts": ts,
+        "fcst_future": fcst_future,
+        "prophet_params": _extract_prophet_params(model),
+        "dias_pronostico": dias_pronostico,
+        "last_hist": last_hist,
+    }
+
+
+# PROPOSITO SIMVEG: Funcion principal del modulo de pronostico (interfaz Streamlit).
+def main() -> None:
+    st.set_page_config(layout="wide", page_title=get_page_title("Pronóstico"))
+    render_platform_header(
+        "Pronóstico de Casos de Violencia",
+        f"Análisis predictivo para el {APP_REGION}.",
+    )
+    render_sidebar_branding()
+
+    df = load_data()
+
+    st.sidebar.header("Filtros")
+
+    min_year = int(df["anio_hecho"].min())
+    max_year = int(df["anio_hecho"].max())
+    sel_years = st.sidebar.slider(
+        "Rango de Años (Ocurrencia)", min_year, max_year, (min_year, max_year)
+    )
+
+    df_f = filter_data_by_years(sel_years[0], sel_years[1])
+
+    muns = ["Todos"] + sorted(df_f["nombre_municipio"].unique())
+    sel_mun = st.sidebar.selectbox("Municipio (Ocurrencia)", muns)
+    if sel_mun != "Todos":
+        df_f = df_f[df_f["nombre_municipio"] == sel_mun]
+
+    nats = ["Todos"] + sorted(df_f["naturaleza"].unique())
+    sel_nat = st.sidebar.selectbox("Modalidad", nats)
+    if sel_nat != "Todos":
+        df_f = df_f[df_f["naturaleza"] == sel_nat]
+
+    vios = ["Todos"] + sorted(df_f["nat_viosex"].unique())
+    sel_vio = st.sidebar.selectbox("Tipo Violencia Sexual", vios)
+    if sel_vio != "Todos":
+        df_f = df_f[df_f["nat_viosex"] == sel_vio]
+
+    orden_logico_edades = [
+        "0-2",
+        "2-7",
+        "7-12",
+        "12-18",
+        "18-24",
+        "25-34",
+        "35-44",
+        "45-54",
+        "54-65",
+        "65+",
+        "Sin Dato",
+    ]
+    edades_presentes = df_f["rango_edad"].unique().tolist()
+    edades_sorted = [e for e in orden_logico_edades if e in edades_presentes]
+    edades_extras = [e for e in edades_presentes if e not in orden_logico_edades]
+    edades = ["Todos"] + edades_sorted + edades_extras
+
+    sel_edad = st.sidebar.selectbox("Rango de Edad", edades)
+    if sel_edad != "Todos":
+        df_f = df_f[df_f["rango_edad"] == sel_edad]
+
+    estratos = ["Todos"] + sorted(df_f["estrato"].unique())
+    sel_est = st.sidebar.selectbox("Estrato", estratos)
+    if sel_est != "Todos":
+        df_f = df_f[df_f["estrato"] == sel_est]
+
+    sex_vict = ["Todos"] + sorted(df_f["sexo_victima"].unique())
+    sel_sex_vict = st.sidebar.selectbox("Sexo Víctima", sex_vict)
+    if sel_sex_vict != "Todos":
+        df_f = df_f[df_f["sexo_victima"] == sel_sex_vict]
+
+    sex_agr = ["Todos"] + sorted(df_f["sexo_agresor"].unique())
+    sel_sex_agr = st.sidebar.selectbox("Sexo Agresor", sex_agr)
+    if sel_sex_agr != "Todos":
+        df_f = df_f[df_f["sexo_agresor"] == sel_sex_agr]
+
+    meses = st.sidebar.slider("Meses a pronosticar", 3, 60, 24, step=3)
+
+    if st.sidebar.button("Generar Pronóstico"):
+        st.session_state["mostrar_pronostico"] = True
+
+    if st.session_state.get("mostrar_pronostico", False):
+        try:
+            forecast = compute_forecast(
+                sel_mun,
+                sel_est,
+                sel_sex_vict,
+                sel_sex_agr,
+                sel_nat,
+                sel_vio,
+                sel_edad,
+                sel_years[0],
+                sel_years[1],
+                meses,
+            )
+
+            ts = forecast["ts"]
+            fcst_future = forecast["fcst_future"]
+            last_hist = forecast["last_hist"]
+            dias_pronostico = forecast["dias_pronostico"]
+            prophet_params = forecast["prophet_params"]
+
+            st.markdown("---")
+            col_drill, _ = st.columns([2, 1])
+            with col_drill:
+                agrupacion = st.radio(
+                    "**Nivel de detalle temporal:**",
+                    options=["Día", "Mes", "Trimestre", "Semestre", "Año"],
+                    index=0,
+                    horizontal=True,
+                )
+
+            freq_dict = {
+                "Día": "D",
+                "Mes": "MS",
+                "Trimestre": "QS",
+                "Semestre": "6MS",
+                "Año": "YS",
+            }
+            freq = freq_dict[agrupacion]
+
+            df_diario = fcst_future[["ds", "yhat"]].copy()
+            df_diario.columns = ["Fecha", "Casos Pronosticados"]
+            st.session_state["df_prophet"] = df_diario
+
+            dist_estrato = df_f["estrato"].value_counts(normalize=True).to_dict()
+            dist_edad = df_f["rango_edad"].value_counts(normalize=True).to_dict()
+            dist_naturaleza = df_f["naturaleza"].value_counts(normalize=True).to_dict()
+
+            st.session_state["sim_params"] = {
+                "municipio": sel_mun,
+                "dias": dias_pronostico,
+                "dist_estrato": dist_estrato,
+                "dist_edad": dist_edad,
+                "dist_naturaleza": dist_naturaleza,
+            }
+
+            ts_agg = ts.set_index("ds").resample(freq).sum().reset_index()
+            fcst_agg = fcst_future.set_index("ds").resample(freq).sum().reset_index()
+
+            ts_agg["y_smooth"] = (
+                ts_agg["y"].rolling(3, center=True, min_periods=1).mean()
+            )
+
+            parts = []
+            if sel_nat != "Todos":
+                parts.append(sel_nat)
+            if sel_vio != "Todos":
+                parts.append(sel_vio)
+            subtitle = ", ".join(parts) if parts else "General"
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=ts_agg["ds"],
+                    y=ts_agg["y_smooth"],
+                    name="Histórico (suavizado)",
+                    mode="lines",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=fcst_agg["ds"],
+                    y=fcst_agg["yhat"],
+                    name="Pronóstico",
+                    mode="lines",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.concat([fcst_agg["ds"], fcst_agg["ds"][::-1]]),
+                    y=pd.concat([fcst_agg["yhat_upper"], fcst_agg["yhat_lower"][::-1]]),
+                    fill="toself",
+                    fillcolor="rgba(0,100,80,0.2)",
+                    line=dict(color="rgba(0,0,0,0)"),
+                    name="Confianza",
+                )
+            )
+
+            fig.add_shape(
+                type="line",
+                x0=last_hist,
+                x1=last_hist,
+                y0=0,
+                y1=ts_agg["y_smooth"].max() * 1.1,
+                line=dict(dash="dash", color="gray"),
+            )
+
+            fig.update_layout(
+                title=f"Pronóstico: {subtitle} en {sel_mun} (Agrupado por {agrupacion})",
+                xaxis_title="Fecha",
+                yaxis_title="Casos Consolidados",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+            st.markdown("### Exportar Resultados")
+
+            export_df = fcst_agg.copy()
+            column_mapping = {
+                "ds": "Fecha",
+                "yhat": "Casos Pronosticados",
+                "yhat_lower": "Límite Mínimo (Confianza)",
+                "yhat_upper": "Límite Máximo (Confianza)",
+                "trend": "Tendencia",
+            }
+            available_cols = [
+                c for c in column_mapping.keys() if c in export_df.columns
+            ]
+            export_df = export_df[available_cols].rename(columns=column_mapping)
+            export_df["Fecha"] = export_df["Fecha"].dt.strftime("%Y-%m-%d")
+
+            params_df = pd.DataFrame(prophet_params)
+
+            filtros_df = pd.DataFrame(
+                {
+                    "Filtro Aplicado": [
+                        "Años",
+                        "Municipio",
+                        "Modalidad",
+                        "Violencia Sexual",
+                        "Rango de Edad",
+                        "Estrato",
+                        "Sexo Víctima",
+                        "Sexo Agresor",
+                        "Agrupación Exportada",
+                    ],
+                    "Valor": [
+                        f"{sel_years[0]} - {sel_years[1]}",
+                        sel_mun,
+                        sel_nat,
+                        sel_vio,
+                        sel_edad,
+                        sel_est,
+                        sel_sex_vict,
+                        sel_sex_agr,
+                        agrupacion,
+                    ],
+                }
+            )
+
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                export_df.to_excel(
+                    writer, index=False, sheet_name=f"Pronostico_{agrupacion}"
+                )
+                params_df.to_excel(
+                    writer, index=False, sheet_name="Parametros_Prophet"
+                )
+                filtros_df.to_excel(writer, index=False, sheet_name="Filtros_Aplicados")
+
+            subtitle_filename = (
+                "_".join(parts).replace(", ", "_") if parts else "General"
+            )
+            st.download_button(
+                label=f"Descargar Informe en Excel)",
+                data=buffer.getvalue(),
+                file_name=f"pronostico_{sel_mun}_{subtitle_filename}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        except ValueError as e:
+            st.error(f"Error: {e}")
+
+    render_platform_footer()
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+ARCHIVO: pages/1_Simulador_Auditoria.py
+DESCRIPCION: Interfaz Streamlit del modulo de auditoria operativa.
+================================================================================
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+
+from config import get_page_title
+from src.agent_based_simulation.runner import (
+    _hashable_prophet,
+    _hashable_sim_params,
+    run_auditoria_simulation,
+)
+from ui.branding import (
+    render_platform_footer,
+    render_platform_header,
+    render_sidebar_branding,
+)
+
+st.set_page_config(layout="wide", page_title=get_page_title("Auditoría Operativa"))
+render_platform_header(
+    "Simulador de Capacidad Institucional y Cuellos de Botella",
+    "Módulo de auditoría operativa basado en datos SIVIGILA.",
+)
+render_sidebar_branding()
+
+if "df_prophet" not in st.session_state or "sim_params" not in st.session_state:
+    st.warning(
+        "Genera el pronóstico en la página principal para cargar la matriz de datos."
+    )
+    render_platform_footer()
+    st.stop()
+
+df_prophet = st.session_state["df_prophet"]
+sim_params = st.session_state["sim_params"]
+
+st.markdown("""
+**Auditoría Basada en Datos:** Modelo estricto de Teoría de Colas y Cadenas de Markov, alimentado por el pronóstico diario de Prophet y la matriz de remisiones reales extraída del SIVIGILA.
+""")
+
+with st.sidebar:
+    st.header("1. Capacidad Base Diaria")
+    cap_salud = st.slider("Cupos Salud Mental (Psicólogos)", 1, 50, 10)
+    cap_prot = st.slider("Cupos Protección (Comisarías)", 1, 50, 15)
+
+    st.header("2. Diseño de Turnos")
+    pct_fin_semana = st.slider(
+        "Retención Operativa Fines de Semana (%)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.2,
+        step=0.1,
+        help="1.0 significa que trabajan al 100% sábados y domingos. 0.0 significa que las dependencias cierran por completo.",
+    )
+
+
+# PROPOSITO SIMVEG: Renderizar histograma pre-agregado de tiempos de espera.
+def _render_histogram_bins(hist_bins: dict) -> None:
+    if not hist_bins or hist_bins.get("bin_edges") is None:
+        return
+
+    bin_edges = hist_bins["bin_edges"]
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    fig_hist = go.Figure()
+
+    if hist_bins.get("alta") is not None:
+        counts, _ = hist_bins["alta"]
+        fig_hist.add_trace(
+            go.Bar(
+                x=bin_centers,
+                y=counts,
+                name="Alta Prioridad (Menores/Sexual)",
+                marker_color="#D32F2F",
+                opacity=0.7,
+            )
+        )
+
+    if hist_bins.get("regular") is not None:
+        counts, _ = hist_bins["regular"]
+        fig_hist.add_trace(
+            go.Bar(
+                x=bin_centers,
+                y=counts,
+                name="Prioridad Regular",
+                marker_color="#9E9E9E",
+                opacity=0.7,
+            )
+        )
+
+    fig_hist.update_layout(
+        title="Distribución Real de Tiempos de Espera por Nivel de Vulnerabilidad",
+        template="plotly_white",
+        barmode="overlay",
+        xaxis_title="Días hasta resolución total",
+        yaxis_title="Cantidad de Víctimas",
+    )
+    st.plotly_chart(fig_hist, width="stretch")
+
+
+# PROPOSITO SIMVEG: Mostrar graficos de rendimiento, backlog y metricas.
+def render_auditoria_results(resultados: dict) -> None:
+    resultados_df = resultados["resultados"]
+    fallos_administrativos = resultados["fallos_administrativos"]
+    hist_bins = resultados.get("hist_bins", {})
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        fig1 = go.Figure()
+        fig1.add_trace(
+            go.Scatter(
+                x=resultados_df["Fecha"],
+                y=resultados_df["Nuevos Casos (Prophet)"].cumsum(),
+                mode="lines",
+                name="Demanda Acumulada",
+                line=dict(color="black", dash="dash"),
+            )
+        )
+        fig1.add_trace(
+            go.Scatter(
+                x=resultados_df["Fecha"],
+                y=resultados_df["Casos Completados"],
+                mode="lines",
+                name="Expedientes Resueltos",
+                fill="tozeroy",
+                fillcolor="rgba(46, 125, 50, 0.3)",
+                line=dict(color="#2E7D32"),
+            )
+        )
+        fig1.update_layout(
+            title="Rendimiento Global del Sistema", template="plotly_white"
+        )
+        st.plotly_chart(fig1, width="stretch")
+
+    with col2:
+        fig2 = go.Figure()
+        fig2.add_trace(
+            go.Scatter(
+                x=resultados_df["Fecha"],
+                y=resultados_df["Backlog Salud Mental"],
+                mode="lines",
+                stackgroup="one",
+                name="Represa: Salud Mental",
+                fillcolor="#1976D2",
+            )
+        )
+        fig2.add_trace(
+            go.Scatter(
+                x=resultados_df["Fecha"],
+                y=resultados_df["Backlog Proteccion"],
+                mode="lines",
+                stackgroup="one",
+                name="Represa: Comisarías (Protección)",
+                fillcolor="#F57C00",
+            )
+        )
+        fig2.update_layout(
+            title="Evolución del Backlog (Nota el efecto 'dientes de sierra' por los fines de semana)",
+            template="plotly_white",
+        )
+        st.plotly_chart(fig2, width="stretch")
+
+    st.markdown("---")
+    st.markdown("### Auditoría de Inequidad y Triage Institucional")
+
+    if hist_bins.get("bin_edges") is not None:
+        c1, c2 = st.columns([1, 2])
+
+        with c1:
+            st.metric(
+                "Total Demanda (Prophet)",
+                int(resultados_df["Nuevos Casos (Prophet)"].sum()),
+            )
+            st.metric(
+                "Expedientes Atrapados (Sin Resolver)",
+                int(resultados_df["Backlog Total"].iloc[-1]),
+            )
+            st.metric(
+                "Fallos Administrativos (> 30 días)",
+                fallos_administrativos,
+                delta_color="inverse",
+            )
+
+        with c2:
+            _render_histogram_bins(hist_bins)
+
+        st.info(
+            "**Análisis de Triage:** El modelo procesa primero a las víctimas de mayor vulnerabilidad (rojo). Sin embargo, si el sistema está muy colapsado, notarás que incluso la curva roja se desplaza hacia la derecha, demostrando que la falta de recursos vulnera hasta los casos más urgentes."
+        )
+
+
+if st.button("Ejecutar Auditoría Operativa", type="primary"):
+    cache_key = (
+        _hashable_prophet(df_prophet),
+        _hashable_sim_params(sim_params),
+        cap_salud,
+        cap_prot,
+        pct_fin_semana,
+    )
+    auditoria_cache = st.session_state.setdefault("auditoria_cache", {})
+
+    if cache_key not in auditoria_cache:
+        progress = st.progress(0, text="Inicializando simulación…")
+
+        def _report_progress(value: float) -> None:
+            pct = int(value * 100)
+            progress.progress(value, text=f"Simulando día a día… {pct}%")
+
+        with st.spinner("Procesando expedientes, triage empírico y calendario..."):
+            auditoria_cache[cache_key] = run_auditoria_simulation(
+                df_prophet=df_prophet,
+                sim_params=sim_params,
+                cap_salud=cap_salud,
+                cap_prot=cap_prot,
+                pct_fin_semana=pct_fin_semana,
+                progress_callback=_report_progress,
+            )
+
+        progress.empty()
+    else:
+        st.toast("Resultados recuperados de caché en memoria.", icon="⚡")
+
+    st.session_state["auditoria_results"] = auditoria_cache[cache_key]
+
+if "auditoria_results" in st.session_state:
+    render_auditoria_results(st.session_state["auditoria_results"])
+
+render_platform_footer()
+
+
+================================================================================
+ARCHIVO: src/agent_based_simulation/agents.py
+DESCRIPCION: Definicion de expedientes y logica de colas institucionales.
+================================================================================
+
+from dataclasses import dataclass
+
+ESTADO_NO_APLICA = 0
+ESTADO_PENDIENTE = 1
+ESTADO_ATENDIDO = 2
+ESTADO_CADUCADO = 3
+
+PRIORIDAD_ALTA = 1
+PRIORIDAD_REGULAR = 2
+
+EDADES_ALTA_PRIORIDAD = frozenset({"0-2", "2-7", "7-12"})
+
+
+@dataclass(slots=True)
+class ExpedienteRecord:
+    dias_espera: int = 0
+    prioridad: int = PRIORIDAD_REGULAR
+    fallo_administrativo: bool = False
+    salud: int = ESTADO_NO_APLICA
+    prot: int = ESTADO_NO_APLICA
+
+    def esta_completado(self) -> bool:
+        return ESTADO_PENDIENTE not in (self.salud, self.prot)
+
+    def avanzar_dia(self) -> None:
+        if self.esta_completado():
+            return
+
+        self.dias_espera += 1
+        if self.dias_espera <= 30:
+            return
+
+        self.fallo_administrativo = True
+        if self.salud == ESTADO_PENDIENTE:
+            self.salud = ESTADO_CADUCADO
+        if self.prot == ESTADO_PENDIENTE:
+            self.prot = ESTADO_CADUCADO
+
+
+# PROPOSITO SIMVEG: Crear expediente con prioridad de triage y rutas Markov.
+def crear_expediente(edad: str, naturaleza: str, ruta_requerida: dict[str, bool]) -> ExpedienteRecord:
+    es_alta = edad in EDADES_ALTA_PRIORIDAD or naturaleza == "Violencia Sexual"
+    return ExpedienteRecord(
+        prioridad=PRIORIDAD_ALTA if es_alta else PRIORIDAD_REGULAR,
+        salud=ESTADO_PENDIENTE if ruta_requerida.get("Salud Mental") else ESTADO_NO_APLICA,
+        prot=ESTADO_PENDIENTE if ruta_requerida.get("Proteccion") else ESTADO_NO_APLICA,
+    )
+
+
+# PROPOSITO SIMVEG: Atender expedientes en cola segun capacidad diaria.
+def procesar_cola_servicio(
+    cola: list[ExpedienteRecord],
+    capacidad: int,
+    servicio: str,
+) -> None:
+    atendidos = 0
+    while atendidos < capacidad and cola:
+        expediente = cola.pop(0)
+        if servicio == "Salud Mental":
+            expediente.salud = ESTADO_ATENDIDO
+        else:
+            expediente.prot = ESTADO_ATENDIDO
+        atendidos += 1
+
+
+================================================================================
+ARCHIVO: src/agent_based_simulation/model.py
+DESCRIPCION: Motor de simulacion diaria basado en agentes.
+================================================================================
+
+import random
+from typing import Callable, Optional
+
+import numpy as np
+import pandas as pd
+
+from .agents import (
+    ESTADO_PENDIENTE,
+    PRIORIDAD_ALTA,
+    crear_expediente,
+    procesar_cola_servicio,
+)
+
+
+class AuditoriaOperativaModel:
+    def __init__(
+        self,
+        df_prophet: pd.DataFrame,
+        sim_params: dict,
+        matriz_markov: dict,
+        capacidades: dict[str, int],
+        pct_fin_semana: float,
+    ):
+        df = df_prophet.reset_index(drop=True)
+        df["Fecha"] = pd.to_datetime(df["Fecha"])
+
+        self.casos_diarios = np.round(
+            np.maximum(0, df["Casos Pronosticados"].to_numpy(dtype=float))
+        ).astype(np.int32)
+        self.es_fin_semana = (df["Fecha"].dt.weekday.to_numpy() >= 5).astype(bool)
+        self.total_dias = int(sim_params["dias"])
+
+        self.matriz_markov = matriz_markov
+        self.capacidades = capacidades
+        self.pct_fin_semana = float(pct_fin_semana)
+        self._markov_default = {"Salud Mental": 0.3, "Proteccion": 0.5}
+
+        self._nats = list(sim_params["dist_naturaleza"].keys())
+        self._p_nats = np.asarray(
+            list(sim_params["dist_naturaleza"].values()), dtype=float
+        )
+        self._edades = list(sim_params["dist_edad"].keys())
+        self._p_edades = np.asarray(list(sim_params["dist_edad"].values()), dtype=float)
+
+        if self._p_nats.sum() > 0:
+            self._p_nats /= self._p_nats.sum()
+        if self._p_edades.sum() > 0:
+            self._p_edades /= self._p_edades.sum()
+
+        self._rng = random.Random()
+
+        self.activos: list = []
+        self.pendientes_por_servicio = {servicio: [] for servicio in capacidades}
+
+        self._completados_total = 0
+        self._fallos_administrativos = 0
+        self._hist_dias: list[int] = []
+        self._hist_prioridad: list[int] = []
+
+        self.metricas_diarias: list[dict] = []
+
+# PROPOSITO SIMVEG: Fijar semilla aleatoria para reproducibilidad.
+    def set_seed(self, seed: int) -> None:
+        self._rng.seed(seed)
+
+# PROPOSITO SIMVEG: Generar nuevos expedientes del dia segun demanda Prophet.
+    def _crear_expedientes_dia(self, cantidad: int) -> None:
+        if cantidad <= 0:
+            return
+
+        naturalezas = (
+            self._rng.choices(self._nats, weights=self._p_nats, k=cantidad)
+            if self._nats
+            else ["Sin Dato"] * cantidad
+        )
+        edades = (
+            self._rng.choices(self._edades, weights=self._p_edades, k=cantidad)
+            if self._edades
+            else ["Sin Dato"] * cantidad
+        )
+
+        for naturaleza, edad in zip(naturalezas, edades):
+            probs = self.matriz_markov.get(naturaleza, self._markov_default)
+            ruta_requerida = {
+                "Salud Mental": self._rng.random() < probs.get("Salud Mental", 0),
+                "Proteccion": self._rng.random() < probs.get("Proteccion", 0),
+            }
+            expediente = crear_expediente(edad, naturaleza, ruta_requerida)
+            self.activos.append(expediente)
+
+            for servicio in self.pendientes_por_servicio:
+                estado = (
+                    expediente.salud
+                    if servicio == "Salud Mental"
+                    else expediente.prot
+                )
+                if estado == ESTADO_PENDIENTE:
+                    self.pendientes_por_servicio[servicio].append(expediente)
+
+# PROPOSITO SIMVEG: Procesar colas de Salud Mental y Proteccion.
+    def _procesar_servicios(self, es_fin_semana: bool) -> None:
+        for servicio, capacidad_base in self.capacidades.items():
+            cola = self.pendientes_por_servicio[servicio]
+            if not cola:
+                continue
+
+            cola.sort(key=lambda exp: (exp.prioridad, -exp.dias_espera))
+            capacidad = (
+                int(capacidad_base * self.pct_fin_semana)
+                if es_fin_semana
+                else capacidad_base
+            )
+            procesar_cola_servicio(cola, capacidad, servicio)
+
+# PROPOSITO SIMVEG: Incrementar dias de espera de expedientes activos.
+    def _avanzar_dia_activos(self) -> None:
+        if not self.activos:
+            return
+
+        pendientes: list = []
+        for expediente in self.activos:
+            expediente.avanzar_dia()
+            if expediente.esta_completado():
+                self._completados_total += 1
+                self._hist_dias.append(expediente.dias_espera)
+                self._hist_prioridad.append(expediente.prioridad)
+                if expediente.fallo_administrativo:
+                    self._fallos_administrativos += 1
+            else:
+                pendientes.append(expediente)
+
+        self.activos = pendientes
+
+# PROPOSITO SIMVEG: Sincronizar listas de pendientes por servicio.
+    def _sincronizar_pendientes(self) -> None:
+        for servicio in self.pendientes_por_servicio:
+            if servicio == "Salud Mental":
+                self.pendientes_por_servicio[servicio] = [
+                    exp for exp in self.activos if exp.salud == ESTADO_PENDIENTE
+                ]
+            else:
+                self.pendientes_por_servicio[servicio] = [
+                    exp for exp in self.activos if exp.prot == ESTADO_PENDIENTE
+                ]
+
+# PROPOSITO SIMVEG: Registrar metricas diarias de la simulacion.
+    def _registrar_metricas(self, nuevos_casos_hoy: int) -> None:
+        self.metricas_diarias.append(
+            {
+                "Nuevos Casos (Prophet)": nuevos_casos_hoy,
+                "Casos Completados": self._completados_total,
+                "Backlog Total": len(self.activos),
+                "Backlog Salud Mental": len(
+                    self.pendientes_por_servicio.get("Salud Mental", [])
+                ),
+                "Backlog Proteccion": len(
+                    self.pendientes_por_servicio.get("Proteccion", [])
+                ),
+            }
+        )
+
+# PROPOSITO SIMVEG: Ejecutar bucle principal de simulacion por numero de dias.
+    def run(
+        self,
+        progress_callback: Optional[Callable[[float], None]] = None,
+        progress_every: int = 25,
+    ) -> None:
+        total = min(self.total_dias, len(self.casos_diarios))
+
+        for dia in range(total):
+            nuevos_casos_hoy = int(self.casos_diarios[dia])
+            es_fin_semana = bool(self.es_fin_semana[dia])
+
+            self._crear_expedientes_dia(nuevos_casos_hoy)
+            self._procesar_servicios(es_fin_semana)
+            self._avanzar_dia_activos()
+            self._sincronizar_pendientes()
+            self._registrar_metricas(nuevos_casos_hoy)
+
+            if progress_callback and (dia % progress_every == 0 or dia == total - 1):
+                progress_callback((dia + 1) / total)
+
+# PROPOSITO SIMVEG: Convertir metricas diarias a DataFrame con fechas.
+    def get_results_dataframe(self, df_prophet: pd.DataFrame) -> pd.DataFrame:
+        resultados = pd.DataFrame(self.metricas_diarias)
+        resultados["Fecha"] = pd.to_datetime(df_prophet["Fecha"]).values[
+            : len(resultados)
+        ]
+        return resultados
+
+# PROPOSITO SIMVEG: Obtener histograma de tiempos de espera y fallos.
+    def get_histogram_dataframe(self) -> tuple[pd.DataFrame, int]:
+        if not self._hist_dias:
+            return pd.DataFrame(), self._fallos_administrativos
+
+        df_hist = pd.DataFrame(
+            {
+                "Dias Espera": self._hist_dias,
+                "Grupo Prioritario": [
+                    (
+                        "Alta Prioridad (Menores/Sexual)"
+                        if prioridad == PRIORIDAD_ALTA
+                        else "Prioridad Regular"
+                    )
+                    for prioridad in self._hist_prioridad
+                ],
+            }
+        )
+        return df_hist, self._fallos_administrativos
+
+# PROPOSITO SIMVEG: Pre-agregar histograma en bins para visualizacion.
+    def get_histogram_bins(self, nbins: int = 30) -> dict:
+        if not self._hist_dias:
+            return {"alta": None, "regular": None}
+
+        dias = np.asarray(self._hist_dias, dtype=np.int32)
+        prioridades = np.asarray(self._hist_prioridad, dtype=np.int8)
+
+        alta = dias[prioridades == PRIORIDAD_ALTA]
+        regular = dias[prioridades != PRIORIDAD_ALTA]
+
+        if alta.size == 0 and regular.size == 0:
+            return {"alta": None, "regular": None}
+
+        max_dia = int(dias.max()) if dias.size else 1
+        bin_edges = np.linspace(0, max(max_dia, 1), nbins + 1)
+
+        return {
+            "alta": np.histogram(alta, bins=bin_edges) if alta.size else None,
+            "regular": np.histogram(regular, bins=bin_edges) if regular.size else None,
+            "bin_edges": bin_edges,
+        }
+
+
+================================================================================
+ARCHIVO: src/agent_based_simulation/runner.py
+DESCRIPCION: Orquestador de la simulacion y salida estructurada.
+================================================================================
+
+import hashlib
+from typing import Callable, Optional
+
+import pandas as pd
+
+from .model import AuditoriaOperativaModel
+
+MATRIZ_MARKOV_EMPIRICA = {
+    "Violencia Física": {"Salud Mental": 0.25, "Proteccion": 0.57},
+    "Violencia Psicológica": {"Salud Mental": 0.88, "Proteccion": 0.81},
+    "Negligencia": {"Salud Mental": 0.90, "Proteccion": 0.77},
+    "Violencia Sexual": {"Salud Mental": 0.85, "Proteccion": 0.90},
+}
+
+
+# PROPOSITO SIMVEG: Convertir parametros de simulacion a tupla hashable.
+def _hashable_sim_params(sim_params: dict) -> tuple:
+    return (
+        sim_params["municipio"],
+        sim_params["dias"],
+        tuple(sorted(sim_params["dist_estrato"].items())),
+        tuple(sorted(sim_params["dist_edad"].items())),
+        tuple(sorted(sim_params["dist_naturaleza"].items())),
+    )
+
+
+# PROPOSITO SIMVEG: Convertir pronostico Prophet a tupla hashable.
+def _hashable_prophet(df_prophet: pd.DataFrame) -> tuple:
+    fechas = pd.to_datetime(df_prophet["Fecha"]).astype(str).tolist()
+    casos = df_prophet["Casos Pronosticados"].round(6).tolist()
+    return tuple(zip(fechas, casos))
+
+
+# PROPOSITO SIMVEG: Generar semilla deterministica MD5 a partir de parametros.
+def _simulation_seed(
+    cap_salud: int,
+    cap_prot: int,
+    pct_fin_semana: float,
+    sim_params: dict,
+    df_prophet: pd.DataFrame,
+) -> int:
+    raw = "|".join(
+        [
+            str(cap_salud),
+            str(cap_prot),
+            str(pct_fin_semana),
+            repr(_hashable_sim_params(sim_params)),
+            repr(_hashable_prophet(df_prophet)),
+        ]
+    )
+    return int(hashlib.md5(raw.encode()).hexdigest()[:8], 16)
+
+
+# PROPOSITO SIMVEG: Funcion publica que ejecuta la auditoria operativa completa.
+def run_auditoria_simulation(
+    df_prophet: pd.DataFrame,
+    sim_params: dict,
+    cap_salud: int,
+    cap_prot: int,
+    pct_fin_semana: float,
+    progress_callback: Optional[Callable[[float], None]] = None,
+) -> dict:
+    """Ejecuta la simulación ABM y devuelve resultados serializables."""
+    modelo = AuditoriaOperativaModel(
+        df_prophet=df_prophet,
+        sim_params=sim_params,
+        matriz_markov=MATRIZ_MARKOV_EMPIRICA,
+        capacidades={"Salud Mental": cap_salud, "Proteccion": cap_prot},
+        pct_fin_semana=pct_fin_semana,
+    )
+    modelo.set_seed(
+        _simulation_seed(cap_salud, cap_prot, pct_fin_semana, sim_params, df_prophet)
+    )
+    modelo.run(progress_callback=progress_callback)
+
+    df_hist, fallos_administrativos = modelo.get_histogram_dataframe()
+
+    return {
+        "resultados": modelo.get_results_dataframe(df_prophet),
+        "df_hist": df_hist,
+        "hist_bins": modelo.get_histogram_bins(),
+        "fallos_administrativos": fallos_administrativos,
+    }
+
+
+================================================================================
+ARCHIVO: streamlit.toml
+DESCRIPCION: Configuracion del servidor Streamlit.
+================================================================================
+
+# SIMVEG - Sistema de Simulación y Modelado de Violencias con Énfasis en Género
+
+[server]
+headless = true
+enableCORS = false
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+
+================================================================================
+ARCHIVO: requirements.txt
+DESCRIPCION: Dependencias Python del sistema SIMVEG.
+================================================================================
+
+prophet
+pandas
+streamlit
+plotly
+openpyxl
+pdfplumber
+mesa<3.0.0
+networkx
+scipy
+
+
+================================================================================
+FIN DEL EXTRACTO CONSOLIDADO DE CODIGO FUENTE - SIMVEG v1.0
+================================================================================
