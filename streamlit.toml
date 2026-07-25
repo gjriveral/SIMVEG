@@ -1,0 +1,9 @@
+# SIMVEG - Sistema de Simulación y Modelado de Violencias con Énfasis en Género
+
+[server]
+headless = true
+enableCORS = false
+port = 8501
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,9 @@
+prophet
+pandas
+streamlit
+plotly
+openpyxl
+pdfplumber
+mesa<3.0.0
+networkx
+scipy

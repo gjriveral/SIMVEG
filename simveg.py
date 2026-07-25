@@ -1,0 +1,506 @@
+import io
+import pandas as pd
+import streamlit as st
+from pathlib import Path
+from typing import Tuple
+from prophet import Prophet
+import plotly.graph_objects as go
+
+from config import APP_REGION, get_page_title
+from ui.branding import (
+    render_platform_footer,
+    render_platform_header,
+    render_sidebar_branding,
+)
+
+DATA_PATH = Path("data/processed/SerieMensual.csv")
+DATA_PATH_STR = str(DATA_PATH)
+
+
+@st.cache_data(show_spinner="Cargando dataset SIMVEG…")
+def load_data(path: str = DATA_PATH_STR) -> pd.DataFrame:
+    """Carga la serie mensual consolidada (una sola vez en memoria)."""
+    df = pd.read_csv(path, parse_dates=["fecha"])
+
+    df["anio_hecho"] = df["anio_hecho"].astype(int)
+    df["mes_num"] = df["mes_num"].astype(int)
+
+    text_cols = [
+        "nombre_municipio",
+        "estrato",
+        "sexo_victima",
+        "sexo_agresor",
+        "naturaleza",
+        "nat_viosex",
+        "rango_edad",
+    ]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+        else:
+            df[col] = "Sin Dato"
+    return df
+
+
+@st.cache_data
+def filter_data_by_years(year_min: int, year_max: int) -> pd.DataFrame:
+    """Subconjunto del dataset por rango de años (cacheado)."""
+    df = load_data()
+    return df[(df["anio_hecho"] >= year_min) & (df["anio_hecho"] <= year_max)]
+
+
+def _filter_series(
+    df: pd.DataFrame,
+    municipio: str,
+    estrato: str,
+    sexo_victima: str,
+    sexo_agresor: str,
+    naturaleza: str,
+    nat_viosex: str,
+    rango_edad: str,
+) -> pd.DataFrame:
+    df_f = df.copy()
+
+    if municipio != "Todos":
+        df_f = df_f[df_f["nombre_municipio"] == municipio]
+    if estrato != "Todos":
+        df_f = df_f[df_f["estrato"] == estrato]
+    if sexo_victima != "Todos":
+        df_f = df_f[df_f["sexo_victima"] == sexo_victima]
+    if sexo_agresor != "Todos":
+        df_f = df_f[df_f["sexo_agresor"] == sexo_agresor]
+    if naturaleza != "Todos":
+        df_f = df_f[df_f["naturaleza"] == naturaleza]
+    if nat_viosex != "Todos":
+        df_f = df_f[df_f["nat_viosex"] == nat_viosex]
+    if rango_edad != "Todos":
+        df_f = df_f[df_f["rango_edad"] == rango_edad]
+
+    return df_f
+
+
+def _build_time_series(df_f: pd.DataFrame) -> pd.DataFrame:
+    ts = (
+        df_f.groupby("fecha", as_index=False)["casos"]
+        .sum()
+        .rename(columns={"fecha": "ds", "casos": "y"})
+        .sort_values("ds")
+    )
+
+    if ts.empty or ts["y"].sum() == 0:
+        raise ValueError("No hay datos para la combinación de filtros seleccionada.")
+
+    return ts
+
+
+def _extract_prophet_params(model: Prophet) -> list[dict]:
+    prophet_params = [
+        {
+            "Parámetro Matemático": "Crecimiento (Growth)",
+            "Valor": str(model.growth),
+        },
+        {
+            "Parámetro Matemático": "Escala de Normalización de 'y' (y_scale)",
+            "Valor": float(model.y_scale),
+        },
+        {
+            "Parámetro Matemático": "Escala de Prior para Puntos de Cambio",
+            "Valor": float(model.changepoint_prior_scale),
+        },
+        {
+            "Parámetro Matemático": "Escala de Prior para Estacionalidad",
+            "Valor": float(model.seasonality_prior_scale),
+        },
+        {
+            "Parámetro Matemático": "Total de Puntos de Cambio Detectados",
+            "Valor": len(model.changepoints),
+        },
+    ]
+
+    if hasattr(model, "params") and model.params is not None:
+        prophet_params.extend(
+            [
+                {
+                    "Parámetro Matemático": "Tasa de Crecimiento Base (k)",
+                    "Valor": float(model.params["k"][0][0]),
+                },
+                {
+                    "Parámetro Matemático": "Offset / Intercepto de Tendencia (m)",
+                    "Valor": float(model.params["m"][0][0]),
+                },
+                {
+                    "Parámetro Matemático": "Ruido de Observación (sigma_obs)",
+                    "Valor": float(model.params["sigma_obs"][0][0]),
+                },
+            ]
+        )
+
+    for name, props in model.seasonalities.items():
+        prophet_params.append(
+            {
+                "Parámetro Matemático": f"Estacionalidad '{name}' (Orden de Fourier)",
+                "Valor": props["fourier_order"],
+            }
+        )
+        prophet_params.append(
+            {
+                "Parámetro Matemático": f"Estacionalidad '{name}' (Prior Scale)",
+                "Valor": props["prior_scale"],
+            }
+        )
+
+    return prophet_params
+
+
+@st.cache_resource(show_spinner="Entrenando modelo Prophet…")
+def train_model_for(
+    municipio: str,
+    estrato: str,
+    sexo_victima: str,
+    sexo_agresor: str,
+    naturaleza: str,
+    nat_viosex: str,
+    rango_edad: str,
+    year_min: int,
+    year_max: int,
+) -> Tuple[Prophet, pd.DataFrame]:
+    df = filter_data_by_years(year_min, year_max)
+    df_f = _filter_series(
+        df,
+        municipio,
+        estrato,
+        sexo_victima,
+        sexo_agresor,
+        naturaleza,
+        nat_viosex,
+        rango_edad,
+    )
+
+    if df_f.empty:
+        raise ValueError("No hay datos para la combinación de filtros seleccionada.")
+
+    ts = _build_time_series(df_f)
+
+    model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        changepoint_range=0.95,
+        changepoint_prior_scale=0.5,
+        seasonality_prior_scale=5.0,
+        seasonality_mode="multiplicative",
+    )
+    model.fit(ts)
+
+    return model, ts
+
+
+@st.cache_data(show_spinner="Calculando pronóstico…")
+def compute_forecast(
+    municipio: str,
+    estrato: str,
+    sexo_victima: str,
+    sexo_agresor: str,
+    naturaleza: str,
+    nat_viosex: str,
+    rango_edad: str,
+    year_min: int,
+    year_max: int,
+    meses: int,
+) -> dict:
+    """Entrena (si hace falta) y predice una sola vez por combinación de filtros."""
+    model, ts = train_model_for(
+        municipio,
+        estrato,
+        sexo_victima,
+        sexo_agresor,
+        naturaleza,
+        nat_viosex,
+        rango_edad,
+        year_min,
+        year_max,
+    )
+
+    dias_pronostico = int(meses * 30.4368)
+    future = model.make_future_dataframe(periods=dias_pronostico, freq="D")
+    fcst = model.predict(future)
+
+    last_hist = ts["ds"].max()
+    fcst_future = fcst[fcst["ds"] > last_hist].copy()
+
+    cols_clip = ["yhat", "yhat_lower", "yhat_upper"]
+    fcst_future[cols_clip] = fcst_future[cols_clip].clip(lower=0)
+
+    return {
+        "ts": ts,
+        "fcst_future": fcst_future,
+        "prophet_params": _extract_prophet_params(model),
+        "dias_pronostico": dias_pronostico,
+        "last_hist": last_hist,
+    }
+
+
+def main() -> None:
+    st.set_page_config(layout="wide", page_title=get_page_title("Pronóstico"))
+    render_platform_header(
+        "Pronóstico de Casos de Violencia",
+        f"Análisis predictivo para el {APP_REGION}.",
+    )
+    render_sidebar_branding()
+
+    df = load_data()
+
+    st.sidebar.header("Filtros")
+
+    min_year = int(df["anio_hecho"].min())
+    max_year = int(df["anio_hecho"].max())
+    sel_years = st.sidebar.slider(
+        "Rango de Años (Ocurrencia)", min_year, max_year, (min_year, max_year)
+    )
+
+    df_f = filter_data_by_years(sel_years[0], sel_years[1])
+
+    muns = ["Todos"] + sorted(df_f["nombre_municipio"].unique())
+    sel_mun = st.sidebar.selectbox("Municipio (Ocurrencia)", muns)
+    if sel_mun != "Todos":
+        df_f = df_f[df_f["nombre_municipio"] == sel_mun]
+
+    nats = ["Todos"] + sorted(df_f["naturaleza"].unique())
+    sel_nat = st.sidebar.selectbox("Modalidad", nats)
+    if sel_nat != "Todos":
+        df_f = df_f[df_f["naturaleza"] == sel_nat]
+
+    vios = ["Todos"] + sorted(df_f["nat_viosex"].unique())
+    sel_vio = st.sidebar.selectbox("Tipo Violencia Sexual", vios)
+    if sel_vio != "Todos":
+        df_f = df_f[df_f["nat_viosex"] == sel_vio]
+
+    orden_logico_edades = [
+        "0-2",
+        "2-7",
+        "7-12",
+        "12-18",
+        "18-24",
+        "25-34",
+        "35-44",
+        "45-54",
+        "54-65",
+        "65+",
+        "Sin Dato",
+    ]
+    edades_presentes = df_f["rango_edad"].unique().tolist()
+    edades_sorted = [e for e in orden_logico_edades if e in edades_presentes]
+    edades_extras = [e for e in edades_presentes if e not in orden_logico_edades]
+    edades = ["Todos"] + edades_sorted + edades_extras
+
+    sel_edad = st.sidebar.selectbox("Rango de Edad", edades)
+    if sel_edad != "Todos":
+        df_f = df_f[df_f["rango_edad"] == sel_edad]
+
+    estratos = ["Todos"] + sorted(df_f["estrato"].unique())
+    sel_est = st.sidebar.selectbox("Estrato", estratos)
+    if sel_est != "Todos":
+        df_f = df_f[df_f["estrato"] == sel_est]
+
+    sex_vict = ["Todos"] + sorted(df_f["sexo_victima"].unique())
+    sel_sex_vict = st.sidebar.selectbox("Sexo Víctima", sex_vict)
+    if sel_sex_vict != "Todos":
+        df_f = df_f[df_f["sexo_victima"] == sel_sex_vict]
+
+    sex_agr = ["Todos"] + sorted(df_f["sexo_agresor"].unique())
+    sel_sex_agr = st.sidebar.selectbox("Sexo Agresor", sex_agr)
+    if sel_sex_agr != "Todos":
+        df_f = df_f[df_f["sexo_agresor"] == sel_sex_agr]
+
+    meses = st.sidebar.slider("Meses a pronosticar", 3, 60, 24, step=3)
+
+    if st.sidebar.button("Generar Pronóstico"):
+        st.session_state["mostrar_pronostico"] = True
+
+    if st.session_state.get("mostrar_pronostico", False):
+        try:
+            forecast = compute_forecast(
+                sel_mun,
+                sel_est,
+                sel_sex_vict,
+                sel_sex_agr,
+                sel_nat,
+                sel_vio,
+                sel_edad,
+                sel_years[0],
+                sel_years[1],
+                meses,
+            )
+
+            ts = forecast["ts"]
+            fcst_future = forecast["fcst_future"]
+            last_hist = forecast["last_hist"]
+            dias_pronostico = forecast["dias_pronostico"]
+            prophet_params = forecast["prophet_params"]
+
+            st.markdown("---")
+            col_drill, _ = st.columns([2, 1])
+            with col_drill:
+                agrupacion = st.radio(
+                    "**Nivel de detalle temporal:**",
+                    options=["Día", "Mes", "Trimestre", "Semestre", "Año"],
+                    index=0,
+                    horizontal=True,
+                )
+
+            freq_dict = {
+                "Día": "D",
+                "Mes": "MS",
+                "Trimestre": "QS",
+                "Semestre": "6MS",
+                "Año": "YS",
+            }
+            freq = freq_dict[agrupacion]
+
+            df_diario = fcst_future[["ds", "yhat"]].copy()
+            df_diario.columns = ["Fecha", "Casos Pronosticados"]
+            st.session_state["df_prophet"] = df_diario
+
+            dist_estrato = df_f["estrato"].value_counts(normalize=True).to_dict()
+            dist_edad = df_f["rango_edad"].value_counts(normalize=True).to_dict()
+            dist_naturaleza = df_f["naturaleza"].value_counts(normalize=True).to_dict()
+
+            st.session_state["sim_params"] = {
+                "municipio": sel_mun,
+                "dias": dias_pronostico,
+                "dist_estrato": dist_estrato,
+                "dist_edad": dist_edad,
+                "dist_naturaleza": dist_naturaleza,
+            }
+
+            ts_agg = ts.set_index("ds").resample(freq).sum().reset_index()
+            fcst_agg = fcst_future.set_index("ds").resample(freq).sum().reset_index()
+
+            ts_agg["y_smooth"] = (
+                ts_agg["y"].rolling(3, center=True, min_periods=1).mean()
+            )
+
+            parts = []
+            if sel_nat != "Todos":
+                parts.append(sel_nat)
+            if sel_vio != "Todos":
+                parts.append(sel_vio)
+            subtitle = ", ".join(parts) if parts else "General"
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=ts_agg["ds"],
+                    y=ts_agg["y_smooth"],
+                    name="Histórico (suavizado)",
+                    mode="lines",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=fcst_agg["ds"],
+                    y=fcst_agg["yhat"],
+                    name="Pronóstico",
+                    mode="lines",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.concat([fcst_agg["ds"], fcst_agg["ds"][::-1]]),
+                    y=pd.concat([fcst_agg["yhat_upper"], fcst_agg["yhat_lower"][::-1]]),
+                    fill="toself",
+                    fillcolor="rgba(0,100,80,0.2)",
+                    line=dict(color="rgba(0,0,0,0)"),
+                    name="Confianza",
+                )
+            )
+
+            fig.add_shape(
+                type="line",
+                x0=last_hist,
+                x1=last_hist,
+                y0=0,
+                y1=ts_agg["y_smooth"].max() * 1.1,
+                line=dict(dash="dash", color="gray"),
+            )
+
+            fig.update_layout(
+                title=f"Pronóstico: {subtitle} en {sel_mun} (Agrupado por {agrupacion})",
+                xaxis_title="Fecha",
+                yaxis_title="Casos Consolidados",
+            )
+            st.plotly_chart(fig, width="stretch")
+
+            st.markdown("### Exportar Resultados")
+
+            export_df = fcst_agg.copy()
+            column_mapping = {
+                "ds": "Fecha",
+                "yhat": "Casos Pronosticados",
+                "yhat_lower": "Límite Mínimo (Confianza)",
+                "yhat_upper": "Límite Máximo (Confianza)",
+                "trend": "Tendencia",
+            }
+            available_cols = [
+                c for c in column_mapping.keys() if c in export_df.columns
+            ]
+            export_df = export_df[available_cols].rename(columns=column_mapping)
+            export_df["Fecha"] = export_df["Fecha"].dt.strftime("%Y-%m-%d")
+
+            params_df = pd.DataFrame(prophet_params)
+
+            filtros_df = pd.DataFrame(
+                {
+                    "Filtro Aplicado": [
+                        "Años",
+                        "Municipio",
+                        "Modalidad",
+                        "Violencia Sexual",
+                        "Rango de Edad",
+                        "Estrato",
+                        "Sexo Víctima",
+                        "Sexo Agresor",
+                        "Agrupación Exportada",
+                    ],
+                    "Valor": [
+                        f"{sel_years[0]} - {sel_years[1]}",
+                        sel_mun,
+                        sel_nat,
+                        sel_vio,
+                        sel_edad,
+                        sel_est,
+                        sel_sex_vict,
+                        sel_sex_agr,
+                        agrupacion,
+                    ],
+                }
+            )
+
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                export_df.to_excel(
+                    writer, index=False, sheet_name=f"Pronostico_{agrupacion}"
+                )
+                params_df.to_excel(
+                    writer, index=False, sheet_name="Parametros_Prophet"
+                )
+                filtros_df.to_excel(writer, index=False, sheet_name="Filtros_Aplicados")
+
+            subtitle_filename = (
+                "_".join(parts).replace(", ", "_") if parts else "General"
+            )
+            st.download_button(
+                label=f"Descargar Informe en Excel)",
+                data=buffer.getvalue(),
+                file_name=f"pronostico_{sel_mun}_{subtitle_filename}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        except ValueError as e:
+            st.error(f"Error: {e}")
+
+    render_platform_footer()
+
+
+if __name__ == "__main__":
+    main()
